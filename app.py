@@ -83,6 +83,7 @@ with tab1:
                 
                 tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
                 tfile.write(uploaded_file.read())
+                tfile.close() # Critical for Windows compatibility: release the lock before cv2 reads it
                 input_video_path = tfile.name
                 
                 output_video_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
@@ -99,7 +100,8 @@ with tab1:
                     st.error("Could not read video frames. The file might be corrupted.")
                     st.stop()
                 
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                # Use avc1 codec (H.264) which natively plays in web browsers seamlessly
+                fourcc = cv2.VideoWriter_fourcc(*'avc1')
                 out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
                 
                 keypoint_data = {
@@ -182,21 +184,19 @@ with tab1:
                 progress_bar.progress(1.0)
                 status_text.text("Processing complete! Preparing outputs...")
                 
-                web_ready_video_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
-                os.system(f"ffmpeg -y -i {output_video_path} -vcodec libx264 -f mp4 {web_ready_video_path}")
-                
                 with open(output_json_path, 'w') as f:
                     json.dump(keypoint_data, f, indent=4)
                 
                 st.success("Analysis Complete!")
                 
                 st.markdown("### Processed Video Result")
-                st.video(web_ready_video_path)
+                # Using the original output video natively since it was encoded with AVC1
+                st.video(output_video_path)
                 
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    with open(web_ready_video_path, 'rb') as f:
+                    with open(output_video_path, 'rb') as f:
                         st.download_button(
                             label="Download Annotated Video (MP4)",
                             data=f,
