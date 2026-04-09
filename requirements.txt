@@ -3,3 +3,5 @@ mediapipe
 numpy
 streamlit-webrtc
 av
+pandas
+plotly
