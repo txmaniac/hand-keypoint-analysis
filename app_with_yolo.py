@@ -274,12 +274,15 @@ with tab1:
                 st.video(output_video_path)
                 
                 col1, col2 = st.columns(2)
+                
+                base_fname = os.path.splitext(uploaded_file.name)[0]
+                
                 with col1:
                     with open(output_video_path, "rb") as f:
-                        st.download_button("Download Annotated Video (MP4)", data=f, file_name=f"processed_{uploaded_file.name}", mime="video/mp4")
+                        st.download_button("Download Annotated Video (MP4)", data=f, file_name=f"processed_{base_fname}.mp4", mime="video/mp4")
                 with col2:
                     with open(output_json_path, "r") as f:
-                        st.download_button("Download Keypoint Data (JSON)", data=f, file_name=f"processed_{uploaded_file.name.replace('.mp4','.json')}", mime="application/json")
+                        st.download_button("Download Keypoint Data (JSON)", data=f, file_name=f"processed_{base_fname}.json", mime="application/json")
 
 
 # -----------------------------
