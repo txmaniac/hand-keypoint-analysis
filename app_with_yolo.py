@@ -170,8 +170,9 @@ with tab1:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-                fourcc = cv2.VideoWriter_fourcc(*"avc1")
-                out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                raw_out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                out = cv2.VideoWriter(raw_out_path, fourcc, fps, (width, height))
 
                 keypoint_data = {
                     "metadata": {
@@ -259,6 +260,11 @@ with tab1:
 
                 cap.release()
                 out.release()
+                
+                # Execute FFmpeg securely to convert the raw linux mp4 into Web-safe H264
+                status_text.text("Converting video to Web-safe format... Please wait.")
+                os.system(f"ffmpeg -y -i {raw_out_path} -vcodec libx264 -f mp4 {output_video_path}")
+                
                 progress_bar.progress(1.0)
                 status_text.text("Processing complete!")
 
