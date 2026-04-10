@@ -271,18 +271,24 @@ with tab1:
                 with open(output_json_path, "w") as f:
                     json.dump(keypoint_data, f, indent=2)
 
-                st.video(output_video_path)
-                
-                col1, col2 = st.columns(2)
-                
-                base_fname = os.path.splitext(uploaded_file.name)[0]
-                
-                with col1:
-                    with open(output_video_path, "rb") as f:
-                        st.download_button("Download Annotated Video (MP4)", data=f, file_name=f"processed_{base_fname}.mp4", mime="video/mp4")
-                with col2:
-                    with open(output_json_path, "r") as f:
-                        st.download_button("Download Keypoint Data (JSON)", data=f, file_name=f"processed_{base_fname}.json", mime="application/json")
+                st.session_state['processed_video_path'] = output_video_path
+                st.session_state['processed_json_path'] = output_json_path
+                st.session_state['processed_file_name'] = uploaded_file.name
+
+        if st.session_state.get('processed_file_name') == uploaded_file.name:
+            out_vid = st.session_state['processed_video_path']
+            out_json = st.session_state['processed_json_path']
+            
+            st.video(out_vid)
+            col1, col2 = st.columns(2)
+            base_fname = os.path.splitext(uploaded_file.name)[0]
+            
+            with col1:
+                with open(out_vid, "rb") as f:
+                    st.download_button("Download Annotated Video (MP4)", data=f, file_name=f"processed_{base_fname}.mp4", mime="video/mp4")
+            with col2:
+                with open(out_json, "r") as f:
+                    st.download_button("Download Keypoint Data (JSON)", data=f, file_name=f"processed_{base_fname}.json", mime="application/json")
 
 
 # -----------------------------
