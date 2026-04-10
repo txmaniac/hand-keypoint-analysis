@@ -1,2 +1,2 @@
 # Running Command
-`streamlit run run_with_yolo.py`
+`streamlit run app_with_yolo.py`
