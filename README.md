@@ -1,2 +1,2 @@
 # Running Command
-`streamlit run yolo_run_analysis.py`
+`streamlit run run_with_yolo.py`
