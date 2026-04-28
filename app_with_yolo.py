@@ -170,9 +170,11 @@ with tab1:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                raw_out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                out = cv2.VideoWriter(raw_out_path, fourcc, fps, (width, height))
+                output_container = av.open(output_video_path, mode='w', format='mp4', options={'movflags': 'faststart'})
+                output_stream = output_container.add_stream('libx264', rate=int(fps))
+                output_stream.width = width
+                output_stream.height = height
+                output_stream.pix_fmt = 'yuv420p'
 
                 keypoint_data = {
                     "metadata": {
@@ -251,7 +253,9 @@ with tab1:
                         }
 
                         keypoint_data["frames"].append(frame_data)
-                        out.write(image)
+                        frame_out = av.VideoFrame.from_ndarray(image, format='bgr24')
+                        for packet in output_stream.encode(frame_out):
+                            output_container.mux(packet)
 
                         frame_idx += 1
                         if frame_idx % max(1, (total_frames // 100)) == 0:
@@ -259,11 +263,11 @@ with tab1:
                             status_text.text(f"Processed {frame_idx}/{total_frames} frames ( {(frame_idx / (time.time() - start_time)):.2f} fps )")
 
                 cap.release()
-                out.release()
                 
-                # Execute FFmpeg securely to convert the raw linux mp4 into Web-safe H264
-                status_text.text("Converting video to Web-safe format... Please wait.")
-                os.system(f"ffmpeg -y -i {raw_out_path} -vcodec libx264 -f mp4 {output_video_path}")
+                # Flush the PyAV encoder
+                for packet in output_stream.encode():
+                    output_container.mux(packet)
+                output_container.close()
                 
                 progress_bar.progress(1.0)
                 status_text.text("Processing complete!")
@@ -302,62 +306,117 @@ with tab3:
     
     if comparative_files:
         st.divider()
-        dfs_distance = []
-        dfs_visibility = []
+        dfs_all = []
         
         for file in comparative_files:
             data = json.load(file)
             fname = data["metadata"]["filename"]
             fps = data["metadata"]["fps"]
             
-            times = []
-            distances = []
-            l_vis = []
-            r_vis = []
+            records = []
             
             for frame in data["frames"]:
                 t = frame["timestamp_sec"]
                 pose = frame.get("pose", [])
+                lh = frame.get("left_hand", [])
+                rh = frame.get("right_hand", [])
                 
-                # Wrist landmarks in MediaPipe Pose: Left=15, Right=16
-                distance = np.nan
+                # Pose Wrist Distance (fallback)
+                pose_dist = np.nan
                 if len(pose) > 16:
-                    lx, ly = pose[15]["x"], pose[15]["y"]
-                    rx, ry = pose[16]["x"], pose[16]["y"]
-                    distance = np.sqrt((rx - lx)**2 + (ry - ly)**2)
+                    pose_dist = np.sqrt((pose[15]["x"] - pose[16]["x"])**2 + (pose[15]["y"] - pose[16]["y"])**2)
                 
-                # Check Hand tracking presence
-                lv = 1 if len(frame.get("left_hand", [])) > 0 else 0
-                rv = 1 if len(frame.get("right_hand", [])) > 0 else 0
+                l_vis = 1 if len(lh) > 0 else 0
+                r_vis = 1 if len(rh) > 0 else 0
                 
-                times.append(t)
-                distances.append(distance)
-                l_vis.append(lv)
-                r_vis.append(rv)
+                def dist3d(a, b):
+                    return np.sqrt((a['x']-b['x'])**2 + (a['y']-b['y'])**2 + (a['z']-b['z'])**2)
                 
-            df_dist = pd.DataFrame({"Time (s)": times, "Wrist Distance": distances, "Video": fname})
-            df_vis = pd.DataFrame({"Time (s)": times, "Left Hand Presence": l_vis, "Right Hand Presence": r_vis, "Video": fname})
+                inter_hand_dist = dist3d(lh[0], rh[0]) if l_vis and r_vis else np.nan
+                
+                l_pinch = dist3d(lh[4], lh[8]) if l_vis and len(lh) > 8 else np.nan
+                r_pinch = dist3d(rh[4], rh[8]) if r_vis and len(rh) > 8 else np.nan
+                
+                l_open = dist3d(lh[0], lh[12]) if l_vis and len(lh) > 12 else np.nan
+                r_open = dist3d(rh[0], rh[12]) if r_vis and len(rh) > 12 else np.nan
+                
+                records.append({
+                    "Time (s)": t,
+                    "Video": fname,
+                    "Pose Wrist Distance": pose_dist,
+                    "Left Hand Presence": l_vis,
+                    "Right Hand Presence": r_vis,
+                    "Inter-Hand Distance": inter_hand_dist,
+                    "Left Pinch": l_pinch,
+                    "Right Pinch": r_pinch,
+                    "Left Openness": l_open,
+                    "Right Openness": r_open,
+                    "L_Wx": lh[0]['x'] if l_vis else np.nan,
+                    "L_Wy": lh[0]['y'] if l_vis else np.nan,
+                    "L_Wz": lh[0]['z'] if l_vis else np.nan,
+                    "R_Wx": rh[0]['x'] if r_vis else np.nan,
+                    "R_Wy": rh[0]['y'] if r_vis else np.nan,
+                    "R_Wz": rh[0]['z'] if r_vis else np.nan,
+                })
             
-            dfs_distance.append(df_dist)
-            dfs_visibility.append(df_vis)
+            df = pd.DataFrame(records)
             
-        if dfs_distance:
-            final_dist = pd.concat(dfs_distance)
-            final_vis = pd.concat(dfs_visibility)
+            # Velocity Calculation
+            df['dt'] = df['Time (s)'].diff().fillna(1.0/fps)
+            df['L_Vel'] = np.sqrt(df['L_Wx'].diff()**2 + df['L_Wy'].diff()**2 + df['L_Wz'].diff()**2) / df['dt']
+            df['R_Vel'] = np.sqrt(df['R_Wx'].diff()**2 + df['R_Wy'].diff()**2 + df['R_Wz'].diff()**2) / df['dt']
             
-            if not final_dist["Wrist Distance"].isna().all():
-                st.markdown("#### Distance Between Wrists (Extension proxy)")
-                fig1 = px.line(final_dist, x="Time (s)", y="Wrist Distance", color="Video", title="Wrist Extension Dynamics over Time")
-                st.plotly_chart(fig1, use_container_width=True)
-            else:
-                 st.warning("Wrist Distance charts are unavailable because Body Pose was completely disabled in the uploaded files.")
-                 
-            st.markdown("#### Left Hand Tracking Visibility %")
-            final_vis["Left Hand Density"] = final_vis.groupby("Video")["Left Hand Presence"].transform(lambda x: x.rolling(10, min_periods=1).mean())
-            fig2 = px.line(final_vis, x="Time (s)", y="Left Hand Density", color="Video", title="Left Hand Activity Window")
-            st.plotly_chart(fig2, use_container_width=True)
+            # Tremor (Smoothness) Calculation
+            window_size = max(3, int(0.5 * fps))
+            df['L_Tremor'] = df['L_Vel'].rolling(window=window_size, min_periods=1).std()
+            df['R_Tremor'] = df['R_Vel'].rolling(window=window_size, min_periods=1).std()
             
-            st.markdown("#### Right Hand Tracking Visibility %")
-            final_vis["Right Hand Density"] = final_vis.groupby("Video")["Right Hand Presence"].transform(lambda x: x.rolling(10, min_periods=1).mean())
-            fig3 = px.line(final_vis, x="Time (s)", y="Right Hand Density", color="Video", title="Right Hand Activity Window")
-            st.plotly_chart(fig3, use_container_width=True)
+            dfs_all.append(df)
+            
+        if dfs_all:
+            final_df = pd.concat(dfs_all)
+            
+            st.markdown("#### 1. Bimanual Coordination")
+            fig_inter = px.line(final_df, x="Time (s)", y="Inter-Hand Distance", color="Video", title="Distance Between Left and Right Hand")
+            st.plotly_chart(fig_inter, use_container_width=True)
+            
+            st.markdown("#### 2. Activity State (Moving vs Resting)")
+            rest_thresh = st.slider("Resting Threshold (speed in normalized units/sec)", 0.0, 2.0, 0.1, 0.05, help="Hand speeds below this value are classified as 'Resting'.")
+            
+            final_df['L_State'] = np.where(final_df['L_Vel'] < rest_thresh, 'Resting', 'Moving')
+            final_df['R_State'] = np.where(final_df['R_Vel'] < rest_thresh, 'Resting', 'Moving')
+            
+            col_l, col_r = st.columns(2)
+            
+            with col_l:
+                state_counts_l = final_df.dropna(subset=['L_Vel']).groupby(['Video', 'L_State']).size().reset_index(name='Frames')
+                fig_state_l = px.bar(state_counts_l, x="Video", y="Frames", color="L_State", title="Left Hand Activity Proportion", barmode='stack')
+                st.plotly_chart(fig_state_l, use_container_width=True)
+                
+                fig_tremor_l = px.line(final_df, x="Time (s)", y="L_Tremor", color="Video", title="Left Movement Jitter (Tremor Proxy)")
+                st.plotly_chart(fig_tremor_l, use_container_width=True)
+                
+                fig_pinch_l = px.line(final_df, x="Time (s)", y="Left Pinch", color="Video", title="Left Pinch Grip Distance")
+                st.plotly_chart(fig_pinch_l, use_container_width=True)
+                
+                fig_open_l = px.line(final_df, x="Time (s)", y="Left Openness", color="Video", title="Left Hand Openness (Wrist to Middle Tip)")
+                st.plotly_chart(fig_open_l, use_container_width=True)
+
+            with col_r:
+                state_counts_r = final_df.dropna(subset=['R_Vel']).groupby(['Video', 'R_State']).size().reset_index(name='Frames')
+                fig_state_r = px.bar(state_counts_r, x="Video", y="Frames", color="R_State", title="Right Hand Activity Proportion", barmode='stack')
+                st.plotly_chart(fig_state_r, use_container_width=True)
+                
+                fig_tremor_r = px.line(final_df, x="Time (s)", y="R_Tremor", color="Video", title="Right Movement Jitter (Tremor Proxy)")
+                st.plotly_chart(fig_tremor_r, use_container_width=True)
+                
+                fig_pinch_r = px.line(final_df, x="Time (s)", y="Right Pinch", color="Video", title="Right Pinch Grip Distance")
+                st.plotly_chart(fig_pinch_r, use_container_width=True)
+                
+                fig_open_r = px.line(final_df, x="Time (s)", y="Right Openness", color="Video", title="Right Hand Openness (Wrist to Middle Tip)")
+                st.plotly_chart(fig_open_r, use_container_width=True)
+
+            if not final_df["Pose Wrist Distance"].isna().all():
+                st.markdown("#### Pose Tracking (Fallback)")
+                fig_pose = px.line(final_df, x="Time (s)", y="Pose Wrist Distance", color="Video", title="Wrist Distance (from Pose framework)")
+                st.plotly_chart(fig_pose, use_container_width=True)
