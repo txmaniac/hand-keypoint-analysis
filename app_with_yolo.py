@@ -153,13 +153,54 @@ with tab1:
     uploaded_file = st.file_uploader("Upload Video File", type=["mp4", "mov", "avi", "webm"])
 
     if uploaded_file is not None:
+        # Cache the uploaded file for live preview
+        if 'preview_video_name' not in st.session_state or st.session_state['preview_video_name'] != uploaded_file.name:
+            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tfile.write(uploaded_file.read())
+            tfile.close()
+            st.session_state['preview_video_path'] = tfile.name
+            st.session_state['preview_video_name'] = uploaded_file.name
+            uploaded_file.seek(0)
+            
+        input_video_path = st.session_state['preview_video_path']
+        
+        # Extract first frame for preview
+        cap_preview = cv2.VideoCapture(input_video_path)
+        success, preview_frame = cap_preview.read()
+        cap_preview.release()
+
+        if success:
+            preview_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+            h, w, _ = preview_rgb.shape
+
+            crop_margins = st.slider(
+                "Crop X-Axis Margins (%)", 
+                0.0, 100.0, (0.0, 100.0), 
+                help="Adjust the left and right crop boundaries of the video. Useful for excluding noise on the edges."
+            )
+
+            left_px = int(w * (crop_margins[0] / 100.0))
+            right_px = int(w * (crop_margins[1] / 100.0))
+
+            if left_px < right_px:
+                # Dim the cropped out regions instead of slicing to preserve aspect ratio
+                preview_display = preview_rgb.copy()
+                if left_px > 0:
+                    preview_display[:, :left_px] = preview_display[:, :left_px] // 3
+                if right_px < w:
+                    preview_display[:, right_px:] = preview_display[:, right_px:] // 3
+                
+                # Draw bright red boundary lines
+                thickness = max(2, w // 250)
+                cv2.line(preview_display, (left_px, 0), (left_px, h), (255, 0, 0), thickness)
+                cv2.line(preview_display, (right_px, 0), (right_px, h), (255, 0, 0), thickness)
+
+                st.image(preview_display, caption="Live Crop Preview (Dimmed regions are excluded)", use_container_width=True)
+            else:
+                st.error("Invalid crop margins. Left margin must be less than right margin.")
+
         if st.button("Start File Analysis"):
             with st.spinner("Executing Tracking Engine..."):
-                tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tfile.write(uploaded_file.read())
-                tfile.close()
-                input_video_path = tfile.name
-
                 output_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
                 output_json_path = tempfile.NamedTemporaryFile(delete=False, suffix=".json").name
 
@@ -170,9 +211,20 @@ with tab1:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+                crop_left_px = int(width * (crop_margins[0] / 100.0))
+                crop_right_px = int(width * (crop_margins[1] / 100.0))
+                if crop_left_px >= crop_right_px:
+                    crop_left_px, crop_right_px = 0, width
+                
+                new_width = crop_right_px - crop_left_px
+                # H264 requires width to be divisible by 2
+                if new_width % 2 != 0:
+                    new_width -= 1
+                    crop_right_px -= 1
+
                 output_container = av.open(output_video_path, mode='w', format='mp4', options={'movflags': 'faststart'})
                 output_stream = output_container.add_stream('libx264', rate=int(fps))
-                output_stream.width = width
+                output_stream.width = new_width
                 output_stream.height = height
                 output_stream.pix_fmt = 'yuv420p'
 
@@ -214,6 +266,10 @@ with tab1:
                         success, image = cap.read()
                         if not success:
                             break
+
+                        # Apply crop margins to the frame width
+                        image = image[:, crop_left_px:crop_right_px]
+
 
                         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                         results = tracker.process(image_rgb)
