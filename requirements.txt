@@ -6,3 +6,4 @@ av
 pandas
 plotly
 opencv-python-headless
+scipy

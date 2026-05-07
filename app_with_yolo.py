@@ -10,6 +10,8 @@ import threading
 import pandas as pd
 import plotly.express as px
 import numpy as np
+import torch
+from scipy.interpolate import interp1d
 from streamlit_webrtc import webrtc_streamer, RTCConfiguration, WebRtcMode
 
 # -----------------------------
@@ -20,11 +22,17 @@ mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
+# Initialize YOLO
+from ultralytics import YOLO
+
+# Determine optimal device for YOLO
+device_type = 'cuda' if torch.cuda.is_available() else ('mps' if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else 'cpu')
+
 st.set_page_config(page_title="Holistic Analyics Engine", page_icon="📈", layout="wide")
 
-st.title("Holistic Keypoint Analytics System")
+st.title("Holistic Keypoint Analytics System (Pipeline V2)")
 st.markdown(
-    "Analyze full body dynamics, hand interactions, and compare trajectories across multiple elicitation video studies."
+    "Analyze full body dynamics, hand interactions, and compare trajectories across multiple elicitation video studies with multi-stage dropout recovery."
 )
 
 # -----------------------------
@@ -32,16 +40,29 @@ st.markdown(
 # -----------------------------
 st.sidebar.header("Configuration")
 
+hands_to_track = st.sidebar.radio("Hands to Track", ["Both", "Left Only", "Right Only"], help="Restrict tracking to a specific hand to prevent hallucinating the other hand from background noise.")
+
 # Toggle to bypass holistic model processing entirely
 enable_body_pose = st.sidebar.toggle(
     "Enable Body Pose", 
     value=True, 
-    help="When turned off, the system will use the lighter, faster `Hands` model to purely capture finger interactions."
+    help="When enabled, runs Pose model and uses wrists for ROI hand fallback."
+)
+
+flip_handedness = st.sidebar.toggle(
+    "POV Toggle", 
+    value=False, 
+    help="Enable this if Left and Right hands are being swapped. Common with selfie-camera videos or mirrored recordings."
 )
 
 model_complexity = st.sidebar.selectbox("Model Complexity", [0, 1, 2], index=1, help="0 is fastest, 2 is most accurate but slowest (1 is baseline).")
-min_detection_confidence = st.sidebar.slider("Min Detection Confidence", 0.0, 1.0, 0.7)
-min_tracking_confidence = st.sidebar.slider("Min Tracking Confidence", 0.0, 1.0, 0.7)
+min_detection_confidence = st.sidebar.slider("Min Detection Confidence", 0.0, 1.0, 0.5, help="Increase if you see random background objects detected as hands. Decrease if hands are genuinely missed.")
+min_tracking_confidence = st.sidebar.slider("Min Tracking Confidence", 0.0, 1.0, 0.5)
+
+st.sidebar.header("Recovery Pipeline")
+max_kalman_frames = st.sidebar.slider("Max Kalman Extrapolation", 0, 30, 15, help="Number of frames to predict using constant velocity when detection fails.")
+max_interp_gap = st.sidebar.slider("Max Interpolation Gap", 0, 60, 30, help="Maximum gap length (in frames) to bridge with linear interpolation post-processing.")
+
 
 tab1, tab2, tab3 = st.tabs(["Upload Video", "Live Webcam", "Comparative Analytics Dashboard"])
 
@@ -65,71 +86,109 @@ def serialize_landmarks(landmark_list):
         for lm in landmark_list.landmark
     ]
 
+class KalmanHandTracker:
+    def __init__(self, num_points=21):
+        self.num_points = num_points
+        self.state = np.zeros((num_points, 6)) # x, y, z, vx, vy, vz
+        self.P = np.array([np.eye(6) * 1000.0 for _ in range(num_points)])
+        self.F = np.eye(6)
+        self.F[0, 3] = 1; self.F[1, 4] = 1; self.F[2, 5] = 1
+        self.H = np.zeros((3, 6))
+        self.H[0, 0] = 1; self.H[1, 1] = 1; self.H[2, 2] = 1
+        self.R = np.eye(3) * 10.0
+        self.Q = np.eye(6) * 1.0
+        self.frames_since_update = 0
+        self.is_initialized = False
+
+    def predict(self):
+        if not self.is_initialized: return None
+        for i in range(self.num_points):
+            self.state[i] = self.F @ self.state[i]
+            # Apply velocity dampening (friction) so points don't fly off screen when tracking is lost
+            self.state[i, 3:] *= 0.6 
+            self.P[i] = self.F @ self.P[i] @ self.F.T + self.Q
+        self.frames_since_update += 1
+        return [{"x": float(p[0]), "y": float(p[1]), "z": float(p[2]), "visibility": 0.5} for p in self.state]
+
+    def update(self, landmarks):
+        if not landmarks: return
+        pts = np.array([[lm['x'], lm['y'], lm['z']] for lm in landmarks])
+        if not self.is_initialized:
+            for i in range(self.num_points):
+                self.state[i, :3] = pts[i]
+            self.is_initialized = True
+        else:
+            for i in range(self.num_points):
+                y = pts[i] - self.H @ self.state[i]
+                S = self.H @ self.P[i] @ self.H.T + self.R
+                K = self.P[i] @ self.H.T @ np.linalg.inv(S)
+                self.state[i] = self.state[i] + K @ y
+                self.P[i] = (np.eye(6) - K @ self.H) @ self.P[i]
+        self.frames_since_update = 0
+
+def crop_and_detect_hand(image_rgb, wrist_x, wrist_y, hands_model, target_label, elbow_x=None, elbow_y=None):
+    """Fallback: crops around wrist and runs hands model."""
+    h, w, _ = image_rgb.shape
+    
+    # Conditional Kinematics
+    if elbow_x is not None and elbow_y is not None:
+        vx = wrist_x - elbow_x
+        vy = wrist_y - elbow_y
+        forearm_len = np.sqrt(vx**2 + vy**2)
+        cx = int((wrist_x + vx * 0.3) * w)
+        cy = int((wrist_y + vy * 0.3) * h)
+        primary_box_size = int(max(h, w) * max(0.2, min(0.6, forearm_len * 1.5)))
+        scales = [primary_box_size, int(primary_box_size * 0.7), int(primary_box_size * 1.3)]
+    else:
+        cx, cy = int(wrist_x * w), int(wrist_y * h)
+        primary_box_size = int(max(h, w) * 0.4) # Slightly larger fallback
+        scales = [primary_box_size, int(max(h, w) * 0.25), int(max(h, w) * 0.55)]
+        
+    for box_size in scales:
+        x1, y1 = max(0, cx - box_size // 2), max(0, cy - box_size // 2)
+        x2, y2 = min(w, cx + box_size // 2), min(h, cy + box_size // 2)
+        
+        if x2 <= x1 or y2 <= y1:
+            continue
+            
+        crop = image_rgb[y1:y2, x1:x2]
+        results = hands_model.process(crop)
+    
+    if results.multi_hand_landmarks and results.multi_handedness:
+        # Search for the correct handedness
+        for hand_lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            if handedness.classification[0].label == target_label:
+                adjusted_lms = []
+                for lm in hand_lms.landmark:
+                    abs_x = x1 + lm.x * (x2 - x1)
+                    abs_y = y1 + lm.y * (y2 - y1)
+                    adjusted_lms.append({
+                        "x": abs_x / w, "y": abs_y / h, "z": lm.z,
+                        "visibility": lm.visibility if hasattr(lm, "visibility") else 1.0
+                    })
+                return adjusted_lms
+    return None
+
 def _analyze_frame(image_bgr):
-    """Annotate frame with selected MediaPipe model dynamically."""
+    """Used by webcam stream only (simplified)."""
     img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     
-    pose_data = []
-    left_hand = []
-    right_hand = []
-
-    if enable_body_pose:
-        if not hasattr(thread_local, "holistic"):
-            thread_local.holistic = mp_holistic.Holistic(
-                static_image_mode=False,
-                model_complexity=model_complexity,
-                min_detection_confidence=min_detection_confidence,
-                min_tracking_confidence=min_tracking_confidence,
-                refine_face_landmarks=False # Disabled for performance and file size
-            )
-
-        results = thread_local.holistic.process(img_rgb)
+    if not hasattr(thread_local, "hands"):
+        thread_local.hands = mp_hands.Hands(
+            static_image_mode=False, max_num_hands=2,
+            model_complexity=model_complexity if model_complexity < 2 else 1,
+            min_detection_confidence=min_detection_confidence, min_tracking_confidence=min_tracking_confidence
+        )
         
-        # Plotting
-        if results.pose_landmarks:
-            mp_drawing.draw_landmarks(image_bgr, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
-        if results.left_hand_landmarks:
-            mp_drawing.draw_landmarks(image_bgr, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS, connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style())
-        if results.right_hand_landmarks:
-            mp_drawing.draw_landmarks(image_bgr, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS, connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style())
-
-        pose_data = serialize_landmarks(results.pose_landmarks)
-        left_hand = serialize_landmarks(results.left_hand_landmarks)
-        right_hand = serialize_landmarks(results.right_hand_landmarks)
-        
-    else:
-        # Fallback to the purely lightweight Hands model
-        if not hasattr(thread_local, "hands"):
-            thread_local.hands = mp_hands.Hands(
-                static_image_mode=False,
-                max_num_hands=2,
-                model_complexity=model_complexity if model_complexity < 2 else 1,
-                min_detection_confidence=min_detection_confidence,
-                min_tracking_confidence=min_tracking_confidence
-            )
-            
-        results = thread_local.hands.process(img_rgb)
-        
-        if results.multi_hand_landmarks and results.multi_handedness:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                mp_drawing.draw_landmarks(
-                    image_bgr, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                    connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style()
-                )
-                if handedness.classification[0].label == 'Left':
-                   left_hand = serialize_landmarks(hand_landmarks)
-                else:
-                   right_hand = serialize_landmarks(hand_landmarks)
-
-    return {
-        "pose": pose_data,
-        "left_hand": left_hand,
-        "right_hand": right_hand
-    }
+    results = thread_local.hands.process(img_rgb)
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_drawing.draw_landmarks(image_bgr, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+    return {}
 
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img = frame.to_ndarray(format="bgr24")
-    _ = _analyze_frame(img)
+    _analyze_frame(img)
     return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # -----------------------------
@@ -153,7 +212,6 @@ with tab1:
     uploaded_file = st.file_uploader("Upload Video File", type=["mp4", "mov", "avi", "webm"])
 
     if uploaded_file is not None:
-        # Cache the uploaded file for live preview
         if 'preview_video_name' not in st.session_state or st.session_state['preview_video_name'] != uploaded_file.name:
             tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             tfile.write(uploaded_file.read())
@@ -164,7 +222,6 @@ with tab1:
             
         input_video_path = st.session_state['preview_video_path']
         
-        # Extract first frame for preview
         cap_preview = cv2.VideoCapture(input_video_path)
         success, preview_frame = cap_preview.read()
         cap_preview.release()
@@ -173,39 +230,28 @@ with tab1:
             preview_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
             h, w, _ = preview_rgb.shape
 
-            crop_margins = st.slider(
-                "Crop X-Axis Margins (%)", 
-                0.0, 100.0, (0.0, 100.0), 
-                help="Adjust the left and right crop boundaries of the video. Useful for excluding noise on the edges."
-            )
+            crop_margins = st.slider("Crop X-Axis Margins (%)", 0.0, 100.0, (0.0, 100.0))
 
             left_px = int(w * (crop_margins[0] / 100.0))
             right_px = int(w * (crop_margins[1] / 100.0))
 
             if left_px < right_px:
-                # Dim the cropped out regions instead of slicing to preserve aspect ratio
                 preview_display = preview_rgb.copy()
-                if left_px > 0:
-                    preview_display[:, :left_px] = preview_display[:, :left_px] // 3
-                if right_px < w:
-                    preview_display[:, right_px:] = preview_display[:, right_px:] // 3
-                
-                # Draw bright red boundary lines
+                if left_px > 0: preview_display[:, :left_px] = preview_display[:, :left_px] // 3
+                if right_px < w: preview_display[:, right_px:] = preview_display[:, right_px:] // 3
                 thickness = max(2, w // 250)
                 cv2.line(preview_display, (left_px, 0), (left_px, h), (255, 0, 0), thickness)
                 cv2.line(preview_display, (right_px, 0), (right_px, h), (255, 0, 0), thickness)
-
-                st.image(preview_display, caption="Live Crop Preview (Dimmed regions are excluded)", use_container_width=True)
+                st.image(preview_display, caption="Live Crop Preview", use_container_width=True)
             else:
-                st.error("Invalid crop margins. Left margin must be less than right margin.")
+                st.error("Invalid crop margins.")
 
         if st.button("Start File Analysis"):
-            with st.spinner("Executing Tracking Engine..."):
+            with st.spinner("Executing Pipeline V2..."):
                 output_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
                 output_json_path = tempfile.NamedTemporaryFile(delete=False, suffix=".json").name
 
                 cap = cv2.VideoCapture(input_video_path)
-
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -217,7 +263,6 @@ with tab1:
                     crop_left_px, crop_right_px = 0, width
                 
                 new_width = crop_right_px - crop_left_px
-                # H264 requires width to be divisible by 2
                 if new_width % 2 != 0:
                     new_width -= 1
                     crop_right_px -= 1
@@ -233,6 +278,7 @@ with tab1:
                         "filename": uploaded_file.name,
                         "fps": fps,
                         "total_frames": total_frames,
+                        "coverage": {"Left": {}, "Right": {}}
                     },
                     "frames": [],
                 }
@@ -241,92 +287,299 @@ with tab1:
                 status_text = st.empty()
                 start_time = time.time()
                 
-                # Context Management Logic for Model Swap
-                engine_config = None
+                hands = mp_hands.Hands(
+                    static_image_mode=False, max_num_hands=2,
+                    model_complexity=model_complexity if model_complexity < 2 else 1,
+                    min_detection_confidence=min_detection_confidence, min_tracking_confidence=min_tracking_confidence
+                )
+                
+                hands_fallback = mp_hands.Hands(
+                    static_image_mode=False, max_num_hands=2,
+                    model_complexity=model_complexity if model_complexity < 2 else 1,
+                    min_detection_confidence=0.15, min_tracking_confidence=0.15
+                )
+                
+                yolo_model = None
                 if enable_body_pose:
-                    engine_config = mp_holistic.Holistic(
-                        static_image_mode=False,
-                        model_complexity=model_complexity,
-                        min_detection_confidence=min_detection_confidence,
-                        min_tracking_confidence=min_tracking_confidence,
-                        refine_face_landmarks=False
-                    )
-                else:
-                    engine_config = mp_hands.Hands(
-                         static_image_mode=False,
-                         max_num_hands=2,
-                         model_complexity=model_complexity if model_complexity < 2 else 1,
-                         min_detection_confidence=min_detection_confidence,
-                         min_tracking_confidence=min_tracking_confidence
-                    )
+                    try:
+                        yolo_model = YOLO("yolo26n-pose.pt")
+                    except Exception as e:
+                        st.error(f"Failed to load YOLO model: {e}")
+                        enable_body_pose = False
 
-                with engine_config as tracker:
-                    frame_idx = 0
-                    while cap.isOpened():
-                        success, image = cap.read()
-                        if not success:
-                            break
+                kalman_l = KalmanHandTracker()
+                kalman_r = KalmanHandTracker()
 
-                        # Apply crop margins to the frame width
-                        image = image[:, crop_left_px:crop_right_px]
+                raw_frames = []
 
+                frame_idx = 0
+                while cap.isOpened():
+                    success, image = cap.read()
+                    if not success: break
 
-                        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                        results = tracker.process(image_rgb)
+                    image = image[:, crop_left_px:crop_right_px]
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    
+                    frame_data = {
+                        "frame_index": frame_idx,
+                        "timestamp_sec": frame_idx / fps,
+                        "pose": [],
+                        "left_hand": [],
+                        "right_hand": [],
+                        "source_l": "missing",
+                        "source_r": "missing"
+                    }
+
+                    # Stage 1: Primary Hands Model
+                    results_h = hands.process(image_rgb)
+                    found_l, found_r = False, False
+                    
+                    if results_h.multi_hand_landmarks and results_h.multi_handedness:
+                        for hlms, hness in zip(results_h.multi_hand_landmarks, results_h.multi_handedness):
+                            label = hness.classification[0].label
+                            if flip_handedness:
+                                label = 'Right' if label == 'Left' else 'Left'
+                                
+                            score = hness.classification[0].score
+                            
+                            # Filter weak handedness to avoid swapping or background noise
+                            if score < 0.6: 
+                                continue
+                                
+                            lms = serialize_landmarks(hlms)
+                            if label == 'Left' and hands_to_track in ["Both", "Left Only"] and not found_l:
+                                frame_data["left_hand"] = lms
+                                frame_data["source_l"] = "detected"
+                                kalman_l.update(lms)
+                                found_l = True
+                            elif label == 'Right' and hands_to_track in ["Both", "Right Only"] and not found_r:
+                                frame_data["right_hand"] = lms
+                                frame_data["source_r"] = "detected"
+                                kalman_r.update(lms)
+                                found_r = True
+
+                    # Stage 2: YOLO Pose & ROI Fallback
+                    if enable_body_pose and yolo_model is not None:
+                        # YOLO runs on the un-cropped image to get better global context, or cropped?
+                        # Since all our coordinates are relative to the cropped image, we should run YOLO on the cropped image
+                        # just like MediaPipe. This avoids complex coordinate translations.
+                        yolo_results = yolo_model(image_rgb, device=device_type, verbose=False)
                         
-                        pose_data = []
-                        left_hand = []
-                        right_hand = []
+                        if len(yolo_results) > 0 and yolo_results[0].keypoints is not None:
+                            # xyn is normalized coordinates [0, 1]
+                            kpts_norm = yolo_results[0].keypoints.xyn.cpu().numpy()
+                            kpts_conf = yolo_results[0].keypoints.conf.cpu().numpy() if yolo_results[0].keypoints.conf is not None else None
+                            
+                            # Can have multiple people
+                            for p_idx in range(len(kpts_norm)):
+                                p_kpts = kpts_norm[p_idx]
+                                p_conf = kpts_conf[p_idx] if kpts_conf is not None else np.ones(17)
+                                
+                                # Left Wrist = 9, Right Wrist = 10
+                                # If flipped, we swap the YOLO indices
+                                left_wrist_idx = 10 if flip_handedness else 9
+                                right_wrist_idx = 9 if flip_handedness else 10
+                                
+                                left_elbow_idx = 8 if flip_handedness else 7
+                                right_elbow_idx = 7 if flip_handedness else 8
+                                
+                                if hands_to_track in ["Both", "Left Only"] and not found_l and p_conf[left_wrist_idx] > 0.6:
+                                    wx, wy = float(p_kpts[left_wrist_idx][0]), float(p_kpts[left_wrist_idx][1])
+                                    if wx > 0 and wy > 0:
+                                        ex = float(p_kpts[left_elbow_idx][0]) if p_conf[left_elbow_idx] > 0.5 else None
+                                        ey = float(p_kpts[left_elbow_idx][1]) if p_conf[left_elbow_idx] > 0.5 else None
+                                        
+                                        target = 'Right' if flip_handedness else 'Left'
+                                        lms = crop_and_detect_hand(image_rgb, wx, wy, hands_fallback, target_label=target, elbow_x=ex, elbow_y=ey)
+                                        if lms:
+                                            frame_data["left_hand"] = lms
+                                            frame_data["source_l"] = "roi_fallback"
+                                            kalman_l.update(lms)
+                                            found_l = True
+                                            break # found left, stop checking other people
+                                            
+                            for p_idx in range(len(kpts_norm)):
+                                p_kpts = kpts_norm[p_idx]
+                                p_conf = kpts_conf[p_idx] if kpts_conf is not None else np.ones(17)
+                                
+                                if hands_to_track in ["Both", "Right Only"] and not found_r and p_conf[right_wrist_idx] > 0.6:
+                                    wx, wy = float(p_kpts[right_wrist_idx][0]), float(p_kpts[right_wrist_idx][1])
+                                    if wx > 0 and wy > 0:
+                                        ex = float(p_kpts[right_elbow_idx][0]) if p_conf[right_elbow_idx] > 0.5 else None
+                                        ey = float(p_kpts[right_elbow_idx][1]) if p_conf[right_elbow_idx] > 0.5 else None
+                                        
+                                        target = 'Left' if flip_handedness else 'Right'
+                                        lms = crop_and_detect_hand(image_rgb, wx, wy, hands_fallback, target_label=target, elbow_x=ex, elbow_y=ey)
+                                        if lms:
+                                            frame_data["right_hand"] = lms
+                                            frame_data["source_r"] = "roi_fallback"
+                                            kalman_r.update(lms)
+                                            found_r = True
+                                            break # found right, stop checking other people
 
-                        if enable_body_pose:
-                            if results.pose_landmarks:
-                                mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
-                                pose_data = serialize_landmarks(results.pose_landmarks)
-                            if results.left_hand_landmarks:
-                                mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS, connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style())
-                                left_hand = serialize_landmarks(results.left_hand_landmarks)
-                            if results.right_hand_landmarks:
-                                mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS, connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style())
-                                right_hand = serialize_landmarks(results.right_hand_landmarks)
-                        else:
-                            if results.multi_hand_landmarks and results.multi_handedness:
-                                for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                                    mp_drawing.draw_landmarks(
-                                        image, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                                        connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style()
-                                    )
-                                    if handedness.classification[0].label == 'Left':
-                                       left_hand = serialize_landmarks(hand_landmarks)
-                                    else:
-                                       right_hand = serialize_landmarks(hand_landmarks)
-                                       
-                        frame_data = {
-                            "frame_index": frame_idx,
-                            "timestamp_sec": frame_idx / fps,
-                            "pose": pose_data,
-                            "left_hand": left_hand,
-                            "right_hand": right_hand
-                        }
+                    # Stage 3: Kalman Prediction
+                    if not found_l and kalman_l.is_initialized and kalman_l.frames_since_update < max_kalman_frames:
+                        pred = kalman_l.predict()
+                        if pred:
+                            frame_data["left_hand"] = pred
+                            frame_data["source_l"] = "kalman_predicted"
+                            
+                    if not found_r and kalman_r.is_initialized and kalman_r.frames_since_update < max_kalman_frames:
+                        pred = kalman_r.predict()
+                        if pred:
+                            frame_data["right_hand"] = pred
+                            frame_data["source_r"] = "kalman_predicted"
 
-                        keypoint_data["frames"].append(frame_data)
-                        frame_out = av.VideoFrame.from_ndarray(image, format='bgr24')
-                        for packet in output_stream.encode(frame_out):
-                            output_container.mux(packet)
+                    if found_l and frame_data["source_l"] in ["detected", "roi_fallback"]:
+                        # Convert back to hand landmarks for drawing
+                        from google.protobuf.json_format import ParseDict
+                        from mediapipe.framework.formats import landmark_pb2
+                        # Draw is deferred to after interpolation if we want to draw everything, but for video output we draw what we have now.
+                        # Actually, we will save the raw_frames, run interpolation, and THEN render video.
+                        pass 
 
-                        frame_idx += 1
-                        if frame_idx % max(1, (total_frames // 100)) == 0:
-                            progress_bar.progress(min(frame_idx / total_frames, 1.0))
-                            status_text.text(f"Processed {frame_idx}/{total_frames} frames ( {(frame_idx / (time.time() - start_time)):.2f} fps )")
+                    raw_frames.append(frame_data)
+
+                    frame_idx += 1
+                    if frame_idx % max(1, (total_frames // 100)) == 0:
+                        progress_bar.progress(min(frame_idx / total_frames * 0.4, 0.4))
+                        status_text.text(f"Pass 1 (Detection): {frame_idx}/{total_frames} frames")
 
                 cap.release()
+                hands.close()
+                hands_fallback.close()
                 
-                # Flush the PyAV encoder
+                # Stage 4: Interpolation Post-Processing
+                status_text.text("Pass 2 (Interpolation)...")
+                
+                def interpolate_gaps(frames, hand_key, source_key):
+                    valid_indices = []
+                    valid_pts = []
+                    for i, f in enumerate(frames):
+                        if f[source_key] in ["detected", "roi_fallback", "kalman_predicted"] and len(f[hand_key]) == 21:
+                            valid_indices.append(i)
+                            valid_pts.append([[p['x'], p['y'], p['z']] for p in f[hand_key]])
+                            
+                    if not valid_indices: return frames
+                    
+                    valid_indices = np.array(valid_indices)
+                    valid_pts = np.array(valid_pts) # shape (N, 21, 3)
+                    
+                    for i in range(21):
+                        for j in range(3):
+                            # interp1d for each coordinate of each landmark
+                            interp_func = interp1d(valid_indices, valid_pts[:, i, j], kind='linear', fill_value="extrapolate")
+                            
+                            # Find gaps
+                            for idx in range(len(frames)):
+                                if frames[idx][source_key] == "missing":
+                                    # Find nearest valid indices
+                                    left_val = valid_indices[valid_indices < idx]
+                                    right_val = valid_indices[valid_indices > idx]
+                                    if len(left_val) > 0 and len(right_val) > 0:
+                                        dist = right_val[0] - left_val[-1]
+                                        if dist <= max_interp_gap:
+                                            if len(frames[idx][hand_key]) == 0:
+                                                frames[idx][hand_key] = [{"x":0, "y":0, "z":0, "visibility":0.5} for _ in range(21)]
+                                            frames[idx][hand_key][i][list('xyz')[j]] = float(interp_func(idx))
+                                            frames[idx][source_key] = "interpolated"
+                    return frames
+
+                if max_interp_gap > 0:
+                    raw_frames = interpolate_gaps(raw_frames, "left_hand", "source_l")
+                    raw_frames = interpolate_gaps(raw_frames, "right_hand", "source_r")
+
+                progress_bar.progress(0.6)
+                
+                # Render Output Video
+                status_text.text("Pass 3 (Rendering Video)...")
+                cap = cv2.VideoCapture(input_video_path)
+                frame_idx = 0
+                
+                # Hand connections for drawing mesh
+                HAND_CONNECTIONS = [
+                    (0, 1), (1, 2), (2, 3), (3, 4),
+                    (0, 5), (5, 6), (6, 7), (7, 8),
+                    (5, 9), (9, 10), (10, 11), (11, 12),
+                    (9, 13), (13, 14), (14, 15), (15, 16),
+                    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)
+                ]
+
+                def get_finger_color(idx):
+                    if idx in [1, 2, 3, 4]: return (0, 140, 255) # Thumb (Orange BGR)
+                    if idx in [5, 6, 7, 8]: return (0, 255, 0) # Index (Green)
+                    if idx in [9, 10, 11, 12]: return (255, 0, 0) # Middle (Blue)
+                    if idx in [13, 14, 15, 16]: return (0, 255, 255) # Ring (Yellow)
+                    if idx in [17, 18, 19, 20]: return (255, 0, 255) # Pinky (Magenta)
+                    return (255, 255, 255) # Palm (White)
+
+                # Re-usable helper for drawing custom mesh
+                def draw_custom_mesh(img, lms, source_color):
+                    if not lms or len(lms) < 21: return
+                    
+                    pts = []
+                    for lm in lms:
+                        pts.append((int(lm['x'] * new_width), int(lm['y'] * height)))
+                        
+                    # Draw lines colored by source (kalman/detected/interp)
+                    for start_idx, end_idx in HAND_CONNECTIONS:
+                        cv2.line(img, pts[start_idx], pts[end_idx], source_color, 2)
+                        
+                    # Draw points colored by finger
+                    for i, pt in enumerate(pts):
+                        cv2.circle(img, pt, 4, get_finger_color(i), -1)
+                        cv2.circle(img, pt, 4, (0, 0, 0), 1) # Outline for contrast
+
+                while cap.isOpened():
+                    success, image = cap.read()
+                    if not success: break
+                    image = image[:, crop_left_px:crop_right_px]
+                    
+                    if frame_idx < len(raw_frames):
+                        f = raw_frames[frame_idx]
+                        
+                        color_map = {
+                            "detected": (0, 255, 0), # Green
+                            "roi_fallback": (255, 255, 0), # Cyan
+                            "kalman_predicted": (0, 165, 255), # Orange
+                            "interpolated": (255, 0, 255) # Purple
+                        }
+                        
+                        if f["source_l"] != "missing":
+                            draw_custom_mesh(image, f["left_hand"], color_map.get(f["source_l"], (255,255,255)))
+                        if f["source_r"] != "missing":
+                            draw_custom_mesh(image, f["right_hand"], color_map.get(f["source_r"], (255,255,255)))
+                            
+                        # Optional: Add text overlay
+                        cv2.putText(image, f"L: {f['source_l']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_map.get(f["source_l"], (0,0,255)), 2)
+                        cv2.putText(image, f"R: {f['source_r']}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_map.get(f["source_r"], (0,0,255)), 2)
+                        
+                    frame_out = av.VideoFrame.from_ndarray(image, format='bgr24')
+                    for packet in output_stream.encode(frame_out):
+                        output_container.mux(packet)
+                        
+                    frame_idx += 1
+                    if frame_idx % max(1, (total_frames // 100)) == 0:
+                        progress_bar.progress(0.6 + min(frame_idx / total_frames * 0.4, 0.4))
+
+                cap.release()
                 for packet in output_stream.encode():
                     output_container.mux(packet)
                 output_container.close()
                 
-                progress_bar.progress(1.0)
-                status_text.text("Processing complete!")
+                # Coverage Stats
+                for side, key in [("Left", "source_l"), ("Right", "source_r")]:
+                    sources = [f[key] for f in raw_frames]
+                    total = len(sources)
+                    det = sources.count("detected") + sources.count("roi_fallback")
+                    recov = sources.count("kalman_predicted") + sources.count("interpolated")
+                    keypoint_data["metadata"]["coverage"][side] = {
+                        "detected_percent": det / total * 100 if total else 0,
+                        "recovered_percent": recov / total * 100 if total else 0,
+                        "missing_percent": sources.count("missing") / total * 100 if total else 0
+                    }
+
+                keypoint_data["frames"] = raw_frames
 
                 with open(output_json_path, "w") as f:
                     json.dump(keypoint_data, f, indent=2)
@@ -334,11 +587,27 @@ with tab1:
                 st.session_state['processed_video_path'] = output_video_path
                 st.session_state['processed_json_path'] = output_json_path
                 st.session_state['processed_file_name'] = uploaded_file.name
+                st.session_state['coverage_data'] = keypoint_data["metadata"]["coverage"]
+                
+                progress_bar.progress(1.0)
+                status_text.text("Processing complete!")
 
         if st.session_state.get('processed_file_name') == uploaded_file.name:
             out_vid = st.session_state['processed_video_path']
             out_json = st.session_state['processed_json_path']
+            cov = st.session_state.get('coverage_data', {})
             
+            # Show coverage
+            st.markdown("### Detection Coverage")
+            col1, col2 = st.columns(2)
+            for side, data in cov.items():
+                col = col1 if side == "Left" else col2
+                with col:
+                    st.markdown(f"**{side} Hand**")
+                    st.progress(data["detected_percent"] / 100, text=f"Detected: {data['detected_percent']:.1f}%")
+                    st.progress(data["recovered_percent"] / 100, text=f"Recovered: {data['recovered_percent']:.1f}%")
+                    st.progress(data["missing_percent"] / 100, text=f"Missing: {data['missing_percent']:.1f}%")
+
             st.video(out_vid)
             col1, col2 = st.columns(2)
             base_fname = os.path.splitext(uploaded_file.name)[0]
@@ -363,11 +632,22 @@ with tab3:
     if comparative_files:
         st.divider()
         dfs_all = []
+        coverage_rows = []
         
         for file in comparative_files:
             data = json.load(file)
             fname = data["metadata"]["filename"]
             fps = data["metadata"]["fps"]
+            cov = data["metadata"].get("coverage", {})
+            
+            if cov:
+                coverage_rows.append({
+                    "Video": fname,
+                    "Left Hand: Directly Detected (%)": cov.get("Left", {}).get("detected_percent", 0),
+                    "Left Hand: Mathematically Recovered (%)": cov.get("Left", {}).get("recovered_percent", 0),
+                    "Right Hand: Directly Detected (%)": cov.get("Right", {}).get("detected_percent", 0),
+                    "Right Hand: Mathematically Recovered (%)": cov.get("Right", {}).get("recovered_percent", 0),
+                })
             
             records = []
             
@@ -377,42 +657,33 @@ with tab3:
                 lh = frame.get("left_hand", [])
                 rh = frame.get("right_hand", [])
                 
-                # Pose Wrist Distance (fallback)
-                pose_dist = np.nan
-                if len(pose) > 16:
-                    pose_dist = np.sqrt((pose[15]["x"] - pose[16]["x"])**2 + (pose[15]["y"] - pose[16]["y"])**2)
-                
-                l_vis = 1 if len(lh) > 0 else 0
-                r_vis = 1 if len(rh) > 0 else 0
+                l_vis = 1 if frame.get("source_l", "missing") != "missing" else 0
+                r_vis = 1 if frame.get("source_r", "missing") != "missing" else 0
                 
                 def dist3d(a, b):
                     return np.sqrt((a['x']-b['x'])**2 + (a['y']-b['y'])**2 + (a['z']-b['z'])**2)
                 
-                inter_hand_dist = dist3d(lh[0], rh[0]) if l_vis and r_vis else np.nan
+                inter_hand_dist = dist3d(lh[0], rh[0]) if l_vis and r_vis and len(lh)>0 and len(rh)>0 else np.nan
                 
                 l_pinch = dist3d(lh[4], lh[8]) if l_vis and len(lh) > 8 else np.nan
                 r_pinch = dist3d(rh[4], rh[8]) if r_vis and len(rh) > 8 else np.nan
                 
-                l_open = dist3d(lh[0], lh[12]) if l_vis and len(lh) > 12 else np.nan
-                r_open = dist3d(rh[0], rh[12]) if r_vis and len(rh) > 12 else np.nan
-                
                 records.append({
                     "Time (s)": t,
                     "Video": fname,
-                    "Pose Wrist Distance": pose_dist,
                     "Left Hand Presence": l_vis,
                     "Right Hand Presence": r_vis,
                     "Inter-Hand Distance": inter_hand_dist,
                     "Left Pinch": l_pinch,
                     "Right Pinch": r_pinch,
-                    "Left Openness": l_open,
-                    "Right Openness": r_open,
-                    "L_Wx": lh[0]['x'] if l_vis else np.nan,
-                    "L_Wy": lh[0]['y'] if l_vis else np.nan,
-                    "L_Wz": lh[0]['z'] if l_vis else np.nan,
-                    "R_Wx": rh[0]['x'] if r_vis else np.nan,
-                    "R_Wy": rh[0]['y'] if r_vis else np.nan,
-                    "R_Wz": rh[0]['z'] if r_vis else np.nan,
+                    "L_Wx": lh[0]['x'] if l_vis and len(lh)>0 else np.nan,
+                    "L_Wy": lh[0]['y'] if l_vis and len(lh)>0 else np.nan,
+                    "L_Wz": lh[0]['z'] if l_vis and len(lh)>0 else np.nan,
+                    "R_Wx": rh[0]['x'] if r_vis and len(rh)>0 else np.nan,
+                    "R_Wy": rh[0]['y'] if r_vis and len(rh)>0 else np.nan,
+                    "R_Wz": rh[0]['z'] if r_vis and len(rh)>0 else np.nan,
+                    "Source_L": frame.get("source_l", "missing"),
+                    "Source_R": frame.get("source_r", "missing")
                 })
             
             df = pd.DataFrame(records)
@@ -429,6 +700,11 @@ with tab3:
             
             dfs_all.append(df)
             
+        if coverage_rows:
+            st.markdown("#### 0. Data Quality / Coverage Summary")
+            cov_df = pd.DataFrame(coverage_rows)
+            st.dataframe(cov_df, use_container_width=True)
+            
         if dfs_all:
             final_df = pd.concat(dfs_all)
             
@@ -436,43 +712,37 @@ with tab3:
             fig_inter = px.line(final_df, x="Time (s)", y="Inter-Hand Distance", color="Video", title="Distance Between Left and Right Hand")
             st.plotly_chart(fig_inter, use_container_width=True)
             
-            st.markdown("#### 2. Activity State (Moving vs Resting)")
-            rest_thresh = st.slider("Resting Threshold (speed in normalized units/sec)", 0.0, 2.0, 0.1, 0.05, help="Hand speeds below this value are classified as 'Resting'.")
+            # Add Source Strip
+            st.markdown("#### Source Reliability Heatmap")
             
-            final_df['L_State'] = np.where(final_df['L_Vel'] < rest_thresh, 'Resting', 'Moving')
-            final_df['R_State'] = np.where(final_df['R_Vel'] < rest_thresh, 'Resting', 'Moving')
+            plotly_color_map = {
+                "detected": "#00FF00",          # Green
+                "roi_fallback": "#FFFF00",      # Yellow
+                "kalman_predicted": "#FFA500",  # Orange
+                "interpolated": "#FF00FF",      # Magenta
+                "missing": "#FF0000"            # Red
+            }
+            
+            fig_source = px.scatter(final_df, x="Time (s)", y="Video", color="Source_L", title="Left Hand Detection Source", symbol="Source_L", color_discrete_map=plotly_color_map)
+            fig_source.update_traces(marker=dict(size=5))
+            st.plotly_chart(fig_source, use_container_width=True)
+            
+            fig_source_r = px.scatter(final_df, x="Time (s)", y="Video", color="Source_R", title="Right Hand Detection Source", symbol="Source_R", color_discrete_map=plotly_color_map)
+            fig_source_r.update_traces(marker=dict(size=5))
+            st.plotly_chart(fig_source_r, use_container_width=True)
             
             col_l, col_r = st.columns(2)
             
             with col_l:
-                state_counts_l = final_df.dropna(subset=['L_Vel']).groupby(['Video', 'L_State']).size().reset_index(name='Frames')
-                fig_state_l = px.bar(state_counts_l, x="Video", y="Frames", color="L_State", title="Left Hand Activity Proportion", barmode='stack')
-                st.plotly_chart(fig_state_l, use_container_width=True)
-                
-                fig_tremor_l = px.line(final_df, x="Time (s)", y="L_Tremor", color="Video", title="Left Movement Jitter (Tremor Proxy)")
+                fig_tremor_l = px.line(final_df, x="Time (s)", y="L_Tremor", color="Video", title="Left Movement Jitter")
                 st.plotly_chart(fig_tremor_l, use_container_width=True)
                 
                 fig_pinch_l = px.line(final_df, x="Time (s)", y="Left Pinch", color="Video", title="Left Pinch Grip Distance")
                 st.plotly_chart(fig_pinch_l, use_container_width=True)
-                
-                fig_open_l = px.line(final_df, x="Time (s)", y="Left Openness", color="Video", title="Left Hand Openness (Wrist to Middle Tip)")
-                st.plotly_chart(fig_open_l, use_container_width=True)
 
             with col_r:
-                state_counts_r = final_df.dropna(subset=['R_Vel']).groupby(['Video', 'R_State']).size().reset_index(name='Frames')
-                fig_state_r = px.bar(state_counts_r, x="Video", y="Frames", color="R_State", title="Right Hand Activity Proportion", barmode='stack')
-                st.plotly_chart(fig_state_r, use_container_width=True)
-                
-                fig_tremor_r = px.line(final_df, x="Time (s)", y="R_Tremor", color="Video", title="Right Movement Jitter (Tremor Proxy)")
+                fig_tremor_r = px.line(final_df, x="Time (s)", y="R_Tremor", color="Video", title="Right Movement Jitter")
                 st.plotly_chart(fig_tremor_r, use_container_width=True)
                 
                 fig_pinch_r = px.line(final_df, x="Time (s)", y="Right Pinch", color="Video", title="Right Pinch Grip Distance")
                 st.plotly_chart(fig_pinch_r, use_container_width=True)
-                
-                fig_open_r = px.line(final_df, x="Time (s)", y="Right Openness", color="Video", title="Right Hand Openness (Wrist to Middle Tip)")
-                st.plotly_chart(fig_open_r, use_container_width=True)
-
-            if not final_df["Pose Wrist Distance"].isna().all():
-                st.markdown("#### Pose Tracking (Fallback)")
-                fig_pose = px.line(final_df, x="Time (s)", y="Pose Wrist Distance", color="Video", title="Wrist Distance (from Pose framework)")
-                st.plotly_chart(fig_pose, use_container_width=True)

@@ -9,6 +9,6 @@ wheels/
 # Virtual environments
 .venv
 *.mov
-
+*.mp4
 # Other
 logs-*.txt
