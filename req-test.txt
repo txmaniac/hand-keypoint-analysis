@@ -1,1 +1,8 @@
-av
+mediapipe>=0.10.0
+opencv-python-headless==4.8.0.74
+av>=11.0.0
+numpy>=1.26.0,<2.0.0
+scipy>=1.11.0
+torch~=2.1.0
+torchvision>=0.16.0
+ultralytics>=8.1.0
