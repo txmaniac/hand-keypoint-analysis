@@ -3,17 +3,17 @@ name = "hand-keypoint-analysis"
 version = "0.2.0"
 description = "Holistic Keypoint Analytics Engine with Two-Stage YOLO Architecture"
 readme = "README.md"
-requires-python = "==3.11.*"
+requires-python = ">=3.10"
 dependencies = [
     "streamlit>=1.30.0",
     "mediapipe>=0.10.0",
-    "opencv-python-headless>=4.8.0",
+    "opencv-python-headless==4.8.0.74",
     "av>=11.0.0",
     "plotly>=5.18.0",
     "pandas>=2.1.0",
-    "numpy>=1.26.0",
+    "numpy>=1.26.0,<2.0.0",
     "scipy>=1.11.0",
-    "torch>=2.1.0",
+    "torch~=2.1.0",
     "torchvision>=0.16.0",
     "ultralytics>=8.1.0",
     "streamlit-webrtc>=0.47.0"
