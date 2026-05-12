@@ -1,0 +1,29 @@
+stages:
+  - build
+
+variables:
+  # Use overlay2 storage driver for better performance
+  DOCKER_DRIVER: overlay2
+  # Disable TLS since we are running dind locally
+  DOCKER_TLS_CERTDIR: ""
+  # Tag the image with the branch name
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+
+build-headless-tracker:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - name: docker:24.0.5-dind
+      alias: docker
+  before_script:
+    # Log into the built-in GitLab Container Registry
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+  script:
+    # Build the hardened Ubuntu/CUDA Dockerfile
+    - echo "Building Holistic Tracker Image..."
+    - docker build -t $IMAGE_TAG .
+    # Push the completed image to the registry so the compute server can pull it
+    - docker push $IMAGE_TAG
+  rules:
+    # Only run the build pipeline when pushing to the main branch
+    - if: $CI_COMMIT_BRANCH == "main"

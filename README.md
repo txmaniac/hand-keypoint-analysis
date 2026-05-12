@@ -48,12 +48,20 @@ Calculates the 3D Euclidean distance between the left wrist and the right wrist 
 ### 2. Fine Motor Mechanics (Pinch Grip)
 Measures the precise 3D distance between the Thumb Tip (Landmark 4) and the Index Finger Tip (Landmark 8). This is a critical metric for evaluating grasping ability and precision motor control.
 
-### 3. Movement Smoothness / Tremor Proxy
-Calculates the "Jitter" by taking the rolling standard deviation of the wrist's inter-frame velocity. 
-- **High values** indicate jerky, tremorous, or uncoordinated movements.
+### 3. Movement Smoothness & Motor Deficits (Velocity & Jerk)
+Calculates the "Jitter" by taking the rolling standard deviation of the wrist's inter-frame velocity, as well as the **Jerk** (the 2nd-order spatial derivative of acceleration).
+- **High jerk spikes** instantly flag hesitation, spasticity, or tracking failures.
 - **Low values** indicate smooth, highly controlled trajectories.
 
-### 4. Source Reliability Heatmap
+### 4. Hand Pronation (Roll Angle)
+Extracts the exact spatial coordinates of the Index MCP (Keypoint 5) and the Pinky MCP (Keypoint 17) to calculate the planar arctangent (atan2). This reveals the absolute degree of wrist roll/pronation on the X-Y plane, which is extremely robust even in POV/top-down footage where 3D depth is compressed.
+
+### 5. Kinematic Phase Portraits
+Instead of tracking metrics against time, the Phase Portrait maps **Inter-Hand Distance** (X-axis) against **Inter-Hand Velocity** (Y-axis). 
+- **Smooth, continuous circles/ellipses** indicate healthy, rhythmic, deliberate biomechanical movements.
+- **Jagged scribbles and tight knots** indicate impaired motor control, hesitation, or erratic velocity changes during movement.
+
+### 6. Source Reliability Heatmap
 A comprehensive visual timeline that color-codes exactly how each frame's keypoints were generated:
 - 🟢 **Green (Directly Detected)**: Found by the Tier 1 primary scan.
 - 🟡 **Yellow (ROI Fallback)**: Rescued by the Tier 2 YOLO low-confidence crop.

@@ -668,6 +668,16 @@ with tab3:
                 l_pinch = dist3d(lh[4], lh[8]) if l_vis and len(lh) > 8 else np.nan
                 r_pinch = dist3d(rh[4], rh[8]) if r_vis and len(rh) > 8 else np.nan
                 
+                def get_roll(hand):
+                    if len(hand) > 17:
+                        dx = hand[17]['x'] - hand[5]['x']
+                        dy = hand[17]['y'] - hand[5]['y']
+                        return np.degrees(np.arctan2(dy, dx))
+                    return np.nan
+                    
+                l_roll = get_roll(lh) if l_vis else np.nan
+                r_roll = get_roll(rh) if r_vis else np.nan
+                
                 records.append({
                     "Time (s)": t,
                     "Video": fname,
@@ -682,6 +692,8 @@ with tab3:
                     "R_Wx": rh[0]['x'] if r_vis and len(rh)>0 else np.nan,
                     "R_Wy": rh[0]['y'] if r_vis and len(rh)>0 else np.nan,
                     "R_Wz": rh[0]['z'] if r_vis and len(rh)>0 else np.nan,
+                    "L_Roll": l_roll,
+                    "R_Roll": r_roll,
                     "Source_L": frame.get("source_l", "missing"),
                     "Source_R": frame.get("source_r", "missing")
                 })
@@ -692,6 +704,15 @@ with tab3:
             df['dt'] = df['Time (s)'].diff().fillna(1.0/fps)
             df['L_Vel'] = np.sqrt(df['L_Wx'].diff()**2 + df['L_Wy'].diff()**2 + df['L_Wz'].diff()**2) / df['dt']
             df['R_Vel'] = np.sqrt(df['R_Wx'].diff()**2 + df['R_Wy'].diff()**2 + df['R_Wz'].diff()**2) / df['dt']
+            df['Inter_Vel'] = df['Inter-Hand Distance'].diff() / df['dt']
+            
+            # Acceleration
+            df['L_Acc'] = df['L_Vel'].diff() / df['dt']
+            df['R_Acc'] = df['R_Vel'].diff() / df['dt']
+            
+            # Jerk
+            df['L_Jerk'] = df['L_Acc'].diff() / df['dt']
+            df['R_Jerk'] = df['R_Acc'].diff() / df['dt']
             
             # Tremor (Smoothness) Calculation
             window_size = max(3, int(0.5 * fps))
@@ -708,8 +729,44 @@ with tab3:
         if dfs_all:
             final_df = pd.concat(dfs_all)
             
+            import plotly.graph_objects as go
+            import plotly.colors as pc
+            
+            def plot_tensorboard_style(df, x_col, y_col, smoothing_weight, title):
+                fig = go.Figure()
+                videos = df["Video"].unique()
+                colors = pc.qualitative.Plotly
+                
+                for i, vid in enumerate(videos):
+                    vid_df = df[df["Video"] == vid]
+                    c = colors[i % len(colors)]
+                    
+                    # Raw Data (Faint)
+                    fig.add_trace(go.Scatter(
+                        x=vid_df[x_col], y=vid_df[y_col],
+                        mode='lines', line=dict(color=c, width=1),
+                        opacity=0.2, name=f"{vid} (Raw)",
+                        showlegend=False
+                    ))
+                    
+                    # Smoothed Data (Solid)
+                    if smoothing_weight > 0:
+                        smoothed = vid_df[y_col].ewm(alpha=1 - smoothing_weight, adjust=False).mean()
+                    else:
+                        smoothed = vid_df[y_col]
+                        
+                    fig.add_trace(go.Scatter(
+                        x=vid_df[x_col], y=smoothed,
+                        mode='lines', line=dict(color=c, width=2.5),
+                        opacity=1.0, name=f"{vid}"
+                    ))
+                    
+                fig.update_layout(title=title, xaxis_title=x_col, yaxis_title=y_col, hovermode="x unified")
+                return fig
+            
             st.markdown("#### 1. Bimanual Coordination")
-            fig_inter = px.line(final_df, x="Time (s)", y="Inter-Hand Distance", color="Video", title="Distance Between Left and Right Hand")
+            smooth_inter = st.slider("TensorBoard Smoothing (Inter-Hand)", 0.0, 0.99, 0.60, 0.05, key="smooth_inter")
+            fig_inter = plot_tensorboard_style(final_df, "Time (s)", "Inter-Hand Distance", smooth_inter, "Distance Between Left and Right Hand")
             st.plotly_chart(fig_inter, use_container_width=True)
             
             # Add Source Strip
@@ -734,15 +791,48 @@ with tab3:
             col_l, col_r = st.columns(2)
             
             with col_l:
-                fig_tremor_l = px.line(final_df, x="Time (s)", y="L_Tremor", color="Video", title="Left Movement Jitter")
+                smooth_tl = st.slider("TensorBoard Smoothing (Left Jitter)", 0.0, 0.99, 0.60, 0.05, key="smooth_tl")
+                fig_tremor_l = plot_tensorboard_style(final_df, "Time (s)", "L_Tremor", smooth_tl, "Left Movement Jitter")
                 st.plotly_chart(fig_tremor_l, use_container_width=True)
                 
-                fig_pinch_l = px.line(final_df, x="Time (s)", y="Left Pinch", color="Video", title="Left Pinch Grip Distance")
+                smooth_pl = st.slider("TensorBoard Smoothing (Left Pinch)", 0.0, 0.99, 0.60, 0.05, key="smooth_pl")
+                fig_pinch_l = plot_tensorboard_style(final_df, "Time (s)", "Left Pinch", smooth_pl, "Left Pinch Grip Distance")
                 st.plotly_chart(fig_pinch_l, use_container_width=True)
 
             with col_r:
-                fig_tremor_r = px.line(final_df, x="Time (s)", y="R_Tremor", color="Video", title="Right Movement Jitter")
+                smooth_tr = st.slider("TensorBoard Smoothing (Right Jitter)", 0.0, 0.99, 0.60, 0.05, key="smooth_tr")
+                fig_tremor_r = plot_tensorboard_style(final_df, "Time (s)", "R_Tremor", smooth_tr, "Right Movement Jitter")
                 st.plotly_chart(fig_tremor_r, use_container_width=True)
                 
-                fig_pinch_r = px.line(final_df, x="Time (s)", y="Right Pinch", color="Video", title="Right Pinch Grip Distance")
+                smooth_pr = st.slider("TensorBoard Smoothing (Right Pinch)", 0.0, 0.99, 0.60, 0.05, key="smooth_pr")
+                fig_pinch_r = plot_tensorboard_style(final_df, "Time (s)", "Right Pinch", smooth_pr, "Right Pinch Grip Distance")
                 st.plotly_chart(fig_pinch_r, use_container_width=True)
+
+            st.markdown("#### 2. Advanced Biomechanics (Jerk & Orientation)")
+            col_l2, col_r2 = st.columns(2)
+            
+            with col_l2:
+                smooth_jerk_l = st.slider("TensorBoard Smoothing (Left Jerk)", 0.0, 0.99, 0.60, 0.05, key="smooth_jerk_l")
+                fig_jerk_l = plot_tensorboard_style(final_df, "Time (s)", "L_Jerk", smooth_jerk_l, "Left Jerk (Motor Smoothness)")
+                st.plotly_chart(fig_jerk_l, use_container_width=True)
+                
+                smooth_roll_l = st.slider("TensorBoard Smoothing (Left Roll)", 0.0, 0.99, 0.60, 0.05, key="smooth_roll_l")
+                fig_roll_l = plot_tensorboard_style(final_df, "Time (s)", "L_Roll", smooth_roll_l, "Left Hand Pronation (Roll Angle)")
+                st.plotly_chart(fig_roll_l, use_container_width=True)
+                
+            with col_r2:
+                smooth_jerk_r = st.slider("TensorBoard Smoothing (Right Jerk)", 0.0, 0.99, 0.60, 0.05, key="smooth_jerk_r")
+                fig_jerk_r = plot_tensorboard_style(final_df, "Time (s)", "R_Jerk", smooth_jerk_r, "Right Jerk (Motor Smoothness)")
+                st.plotly_chart(fig_jerk_r, use_container_width=True)
+                
+                smooth_roll_r = st.slider("TensorBoard Smoothing (Right Roll)", 0.0, 0.99, 0.60, 0.05, key="smooth_roll_r")
+                fig_roll_r = plot_tensorboard_style(final_df, "Time (s)", "R_Roll", smooth_roll_r, "Right Hand Pronation (Roll Angle)")
+                st.plotly_chart(fig_roll_r, use_container_width=True)
+                
+            st.markdown("#### 3. Kinematic Phase Portraits")
+            st.markdown("A Phase Portrait plots Distance against Velocity to reveal cyclical movement loops. Healthy deliberate movement forms clean circles, while erratic movement creates jagged scribbles.")
+            fig_phase = px.line(final_df.dropna(subset=["Inter-Hand Distance", "Inter_Vel"]), 
+                                x="Inter-Hand Distance", y="Inter_Vel", color="Video", 
+                                title="Bimanual Phase Space (Distance vs Velocity)")
+            st.plotly_chart(fig_phase, use_container_width=True)
+

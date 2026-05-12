@@ -12,3 +12,4 @@ wheels/
 *.mp4
 # Other
 logs-*.txt
+*.json

@@ -1,7 +1,7 @@
 import argparse
 import av
 import cv2
-import mediapipe.python.solutions.hands as mp_hands_module
+import mediapipe as mp
 import os
 import json
 import time
@@ -375,6 +375,7 @@ def main():
         print(f"Failed to load YOLO model: {e}")
         print("Running with standard MediaPipe only.")
 
+    mp_hands_module = mp.solutions.hands
     hands_tracker = mp_hands_module.Hands(
         static_image_mode=False, max_num_hands=2,
         model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5
