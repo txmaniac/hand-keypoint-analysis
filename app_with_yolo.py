@@ -11,6 +11,8 @@ import pandas as pd
 import plotly.express as px
 import numpy as np
 import torch
+import zipfile
+import io
 from scipy.interpolate import interp1d
 from streamlit_webrtc import webrtc_streamer, RTCConfiguration, WebRtcMode
 
@@ -21,6 +23,39 @@ mp_holistic = mp.solutions.holistic
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
+
+# Hand connections for drawing mesh
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)
+]
+
+def get_finger_color(idx):
+    if idx in [1, 2, 3, 4]: return (0, 140, 255) # Thumb (Orange BGR)
+    if idx in [5, 6, 7, 8]: return (0, 255, 0) # Index (Green)
+    if idx in [9, 10, 11, 12]: return (255, 0, 0) # Middle (Blue)
+    if idx in [13, 14, 15, 16]: return (0, 255, 255) # Ring (Yellow)
+    if idx in [17, 18, 19, 20]: return (255, 0, 255) # Pinky (Magenta)
+    return (255, 255, 255) # Palm (White)
+
+def draw_custom_mesh(img, lms, source_color, width, height):
+    if not lms or len(lms) < 21: return
+    
+    pts = []
+    for lm in lms:
+        pts.append((int(lm['x'] * width), int(lm['y'] * height)))
+        
+    # Draw lines colored by source
+    for start_idx, end_idx in HAND_CONNECTIONS:
+        cv2.line(img, pts[start_idx], pts[end_idx], source_color, 2)
+        
+    # Draw points colored by finger
+    for i, pt in enumerate(pts):
+        cv2.circle(img, pt, 4, get_finger_color(i), -1)
+        cv2.circle(img, pt, 4, (0, 0, 0), 1) # Outline for contrast
 
 # Initialize YOLO
 from ultralytics import YOLO
@@ -64,7 +99,7 @@ max_kalman_frames = st.sidebar.slider("Max Kalman Extrapolation", 0, 30, 15, hel
 max_interp_gap = st.sidebar.slider("Max Interpolation Gap", 0, 60, 30, help="Maximum gap length (in frames) to bridge with linear interpolation post-processing.")
 
 
-tab1, tab2, tab3 = st.tabs(["Upload Video", "Live Webcam", "Comparative Analytics Dashboard"])
+tab1, tab2, tab3, tab4 = st.tabs(["Upload Video", "Live Webcam", "Comparative Analytics Dashboard", "JSON to Video Converter"])
 
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
@@ -278,6 +313,8 @@ with tab1:
                         "filename": uploaded_file.name,
                         "fps": fps,
                         "total_frames": total_frames,
+                        "width": new_width,
+                        "height": height,
                         "coverage": {"Left": {}, "Right": {}}
                     },
                     "frames": [],
@@ -496,39 +533,7 @@ with tab1:
                 cap = cv2.VideoCapture(input_video_path)
                 frame_idx = 0
                 
-                # Hand connections for drawing mesh
-                HAND_CONNECTIONS = [
-                    (0, 1), (1, 2), (2, 3), (3, 4),
-                    (0, 5), (5, 6), (6, 7), (7, 8),
-                    (5, 9), (9, 10), (10, 11), (11, 12),
-                    (9, 13), (13, 14), (14, 15), (15, 16),
-                    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)
-                ]
-
-                def get_finger_color(idx):
-                    if idx in [1, 2, 3, 4]: return (0, 140, 255) # Thumb (Orange BGR)
-                    if idx in [5, 6, 7, 8]: return (0, 255, 0) # Index (Green)
-                    if idx in [9, 10, 11, 12]: return (255, 0, 0) # Middle (Blue)
-                    if idx in [13, 14, 15, 16]: return (0, 255, 255) # Ring (Yellow)
-                    if idx in [17, 18, 19, 20]: return (255, 0, 255) # Pinky (Magenta)
-                    return (255, 255, 255) # Palm (White)
-
-                # Re-usable helper for drawing custom mesh
-                def draw_custom_mesh(img, lms, source_color):
-                    if not lms or len(lms) < 21: return
-                    
-                    pts = []
-                    for lm in lms:
-                        pts.append((int(lm['x'] * new_width), int(lm['y'] * height)))
-                        
-                    # Draw lines colored by source (kalman/detected/interp)
-                    for start_idx, end_idx in HAND_CONNECTIONS:
-                        cv2.line(img, pts[start_idx], pts[end_idx], source_color, 2)
-                        
-                    # Draw points colored by finger
-                    for i, pt in enumerate(pts):
-                        cv2.circle(img, pt, 4, get_finger_color(i), -1)
-                        cv2.circle(img, pt, 4, (0, 0, 0), 1) # Outline for contrast
+                # Using the global draw_custom_mesh function
 
                 while cap.isOpened():
                     success, image = cap.read()
@@ -546,9 +551,9 @@ with tab1:
                         }
                         
                         if f["source_l"] != "missing":
-                            draw_custom_mesh(image, f["left_hand"], color_map.get(f["source_l"], (255,255,255)))
+                            draw_custom_mesh(image, f["left_hand"], color_map.get(f["source_l"], (255,255,255)), new_width, height)
                         if f["source_r"] != "missing":
-                            draw_custom_mesh(image, f["right_hand"], color_map.get(f["source_r"], (255,255,255)))
+                            draw_custom_mesh(image, f["right_hand"], color_map.get(f["source_r"], (255,255,255)), new_width, height)
                             
                         # Optional: Add text overlay
                         cv2.putText(image, f"L: {f['source_l']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_map.get(f["source_l"], (0,0,255)), 2)
@@ -835,4 +840,128 @@ with tab3:
                                 x="Inter-Hand Distance", y="Inter_Vel", color="Video", 
                                 title="Bimanual Phase Space (Distance vs Velocity)")
             st.plotly_chart(fig_phase, use_container_width=True)
+
+
+# -----------------------------
+# JSON to Video Tab
+# -----------------------------
+with tab4:
+    st.markdown("### 🎞️ JSON to Video Converter (Batch Mode)")
+    st.markdown("Upload multiple `keypoints.json` files to generate MP4 videos of the animated biomechanical model.")
+    
+    json_files = st.file_uploader("Upload keypoints JSON", type=["json"], accept_multiple_files=True)
+    
+    if json_files:
+        st.markdown("#### Configuration")
+        col1, col2 = st.columns(2)
+        
+        # Load the first file to get default metadata
+        data_preview = json.load(json_files[0])
+        json_files[0].seek(0) # reset pointer for later processing
+        
+        meta = data_preview.get("metadata", {})
+        default_w = meta.get("width", 1920)
+        default_h = meta.get("height", 1080)
+        default_fps = meta.get("fps", 30.0)
+        
+        if "width" not in meta or "height" not in meta:
+            st.warning("Original video resolution not found in the first JSON file. Using defaults. Please specify output resolution if known.")
+            
+        with col1:
+            out_w = st.number_input("Output Width", min_value=128, max_value=3840, value=default_w)
+            out_h = st.number_input("Output Height", min_value=128, max_value=2160, value=default_h)
+            
+        with col2:
+            out_fps = st.number_input("Output FPS", min_value=1.0, max_value=120.0, value=float(default_fps))
+            
+        if st.button("Generate Videos"):
+            with st.spinner(f"Generating {len(json_files)} video(s)..."):
+                zip_buffer = io.BytesIO()
+                
+                overall_progress = st.progress(0)
+                overall_status = st.empty()
+                
+                # Keep track of the last processed video path for preview
+                last_video_path = None
+                
+                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                    for f_idx, j_file in enumerate(json_files):
+                        overall_status.text(f"Processing file {f_idx+1}/{len(json_files)}: {j_file.name}")
+                        data = json.load(j_file)
+                        
+                        output_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                        last_video_path = output_video_path
+                        
+                        output_container = av.open(output_video_path, mode='w', format='mp4', options={'movflags': 'faststart'})
+                        output_stream = output_container.add_stream('libx264', rate=int(out_fps))
+                        output_stream.width = out_w
+                        output_stream.height = out_h
+                        output_stream.pix_fmt = 'yuv420p'
+                        
+                        frames = data.get("frames", [])
+                        
+                        for f in frames:
+                            # Create black background
+                            image = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+                            
+                            color_map = {
+                                "detected": (0, 255, 0), # Green
+                                "roi_fallback": (255, 255, 0), # Cyan
+                                "kalman_predicted": (0, 165, 255), # Orange
+                                "interpolated": (255, 0, 255) # Purple
+                            }
+                            
+                            source_l = f.get("source_l", "missing")
+                            source_r = f.get("source_r", "missing")
+                            
+                            if source_l != "missing":
+                                draw_custom_mesh(image, f.get("left_hand", []), color_map.get(source_l, (255,255,255)), out_w, out_h)
+                            if source_r != "missing":
+                                draw_custom_mesh(image, f.get("right_hand", []), color_map.get(source_r, (255,255,255)), out_w, out_h)
+                                
+                            cv2.putText(image, f"L: {source_l}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_map.get(source_l, (0,0,255)), 2)
+                            cv2.putText(image, f"R: {source_r}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_map.get(source_r, (0,0,255)), 2)
+                            
+                            # Convert to AV Frame
+                            frame_out = av.VideoFrame.from_ndarray(image, format='bgr24')
+                            for packet in output_stream.encode(frame_out):
+                                output_container.mux(packet)
+                                
+                        # Flush
+                        for packet in output_stream.encode():
+                            output_container.mux(packet)
+                        output_container.close()
+                        
+                        # Add to ZIP
+                        with open(output_video_path, "rb") as vf:
+                            video_name = f"generated_{j_file.name.replace('.json', '.mp4')}"
+                            zip_file.writestr(video_name, vf.read())
+                            
+                        overall_progress.progress((f_idx + 1) / len(json_files))
+                        
+                overall_status.text("Generation complete!")
+                st.success(f"Generated {len(json_files)} video(s) Successfully!")
+                
+                if len(json_files) == 1 and last_video_path:
+                    st.video(last_video_path)
+                    with open(last_video_path, "rb") as vf:
+                        st.download_button(
+                            label="Download Generated Video (MP4)",
+                            data=vf,
+                            file_name=f"generated_{json_files[0].name.replace('.json', '.mp4')}",
+                            mime="video/mp4"
+                        )
+                else:
+                    if last_video_path:
+                        st.markdown("### Preview (Last Processed File)")
+                        st.video(last_video_path)
+                    
+                    zip_buffer.seek(0)
+                    st.download_button(
+                        label=f"Download All {len(json_files)} Videos (ZIP)",
+                        data=zip_buffer,
+                        file_name="generated_videos.zip",
+                        mime="application/zip"
+                    )
+
 
